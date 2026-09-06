@@ -10,6 +10,10 @@ first ever release.
 - a "download binary first, only compile from source if needed" install
   flow — it checks apt for a ready-made package before ever building
   anything from source
+- **Flatpak support** — if `flatpak` is installed, search and install
+  results also include matching Flathub apps, tagged `[flatpak]`. If apt
+  has nothing for a package but Flatpak does, `buzz install` will offer
+  that instead of building from source
 - a local build cache, so rebuilding the same version twice is instant
 - confirmation prompts before anything destructive happens, with
   `--noconfirm` to skip them
@@ -96,6 +100,38 @@ already has a candidate version, it just runs `apt-get install` directly
 - the target is a git URL, or
 - apt has no binary candidate for the package, or
 - you pass `--build` to force it
+
+## Flatpak
+
+If you have `flatpak` installed, `buzz` will automatically search and
+offer Flathub apps too — no extra flags needed. Search results tag them
+`[flatpak]` so you can tell them apart from apt/buzz-tracked entries.
+
+**⚠️ Important: `buzz` always installs Flatpak apps system-wide (with
+`sudo`), not per-user.** Every install in `buzz` — apt or Flatpak — runs
+through the same `sudo` path, for consistency. This means:
+
+- Flatpak apps installed via `buzz` go into `/var/lib/flatpak` (shared,
+  available to every user on the machine), **not** `~/.local/share/flatpak`
+  (the usual per-user Flatpak default).
+- If you specifically want a **per-user** Flatpak install instead, don't
+  use `buzz` for that app — install it yourself with:
+  ```bash
+  flatpak install --user flathub <app-id>
+  ```
+
+`buzz` does **not** install Flatpak for you. Install it first with your
+distro's normal tools, e.g.:
+
+```bash
+sudo apt install flatpak
+```
+
+The first time `buzz` needs to install something via Flatpak, it'll offer
+to add the Flathub remote automatically if it isn't already set up.
+
+Removing Flatpak apps isn't wired into `buzz remove` yet — use
+`flatpak uninstall <app-id>` directly for now.
 
 ## License
 
