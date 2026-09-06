@@ -40,7 +40,7 @@ You'll need Rust installed. If you don't have it, `install.sh` will offer
 to install it for you via [rustup](https://rustup.rs).
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/buzz.git
+git clone https://github.com/Yaptitude/buzz.git
 cd buzz
 chmod +x install.sh
 ./install.sh
@@ -65,6 +65,18 @@ script will warn you if it isn't.)
 ./install.sh --uninstall
 ```
 
+## Project structure
+
+```
+buzz/
+├── .gitignore
+├── Cargo.toml
+├── README.md
+├── install.sh
+└── src/
+    └── main.rs
+```
+
 ## Requirements
 
 - A Debian-based Linux distro (Debian, Ubuntu, Mint, etc.)
@@ -87,4 +99,4 @@ already has a candidate version, it just runs `apt-get install` directly
 
 ## License
 
-MIT (or pick whatever you'd like here)
+MIT
