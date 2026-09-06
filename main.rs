@@ -52,6 +52,7 @@ fn red(t: &str) -> String { c("31;1", t) }
 fn yellow(t: &str) -> String { c("33;1", t) }
 fn bold(t: &str) -> String { c("1", t) }
 fn dim(t: &str) -> String { c("2", t) }
+fn magenta(t: &str) -> String { c("35;1", t) } // used for flatpak results in the picker
 
 fn log(msg: &str, level: char) {
     // using chars instead of strings here bc i didnt wanna type out
@@ -529,6 +530,71 @@ fn package_binary_available(name: &str) -> bool {
     }
 }
 
+// same idea as package_binary_available but for flatpak. flatpak might not
+// even be installed on the system so gotta check that first
+fn flatpak_available() -> bool {
+    Command::new("flatpak").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+// flathub is the actual app store basically, flatpak on its own doesn't
+// have any apps configured by default on most systems
+fn flatpak_has_flathub() -> bool {
+    match Command::new("flatpak").args(["remote-list"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).contains("flathub"),
+        _ => false,
+    }
+}
+
+fn flatpak_ensure_flathub(noconfirm: bool) {
+    if !flatpak_available() || flatpak_has_flathub() {
+        return;
+    }
+    if confirm("Flatpak is installed but the flathub remote isn't set up. Add it now?", true, noconfirm) {
+        run(
+            &["flatpak", "remote-add", "--if-not-exists", "flathub", "https://flathub.org/repo/flathub.flatpakrepo"],
+            None,
+            true,
+        );
+    }
+}
+
+// returns (app_id, name, description) for each match. flatpak search prints
+// tab separated columns, no header row on most versions i've seen
+fn flatpak_search_raw(term: &str) -> Vec<(String, String, String)> {
+    if !flatpak_available() {
+        return Vec::new();
+    }
+    let out = Command::new("flatpak").args(["search", term]).output();
+    let text = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Vec::new(),
+    };
+    let mut results = Vec::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        // Name, Description, Application ID, Version, Branch, Remotes - in that order
+        if cols.len() >= 3 {
+            let name = cols[0].trim().to_string();
+            let desc = cols[1].trim().to_string();
+            let app_id = cols[2].trim().to_string();
+            if !app_id.is_empty() {
+                results.push((app_id, name, desc));
+            }
+        }
+    }
+    results
+}
+
+fn install_via_flatpak(app_id: &str, noconfirm: bool) {
+    flatpak_ensure_flathub(noconfirm);
+    if !confirm(&format!("Install '{}' via Flatpak?", app_id), true, noconfirm) {
+        log(&format!("Skipped '{}'.", app_id), '-');
+        return;
+    }
+    run(&["flatpak", "install", "-y", "flathub", app_id], None, true);
+    log(&format!("'{}' installed via Flatpak.", app_id), '+');
+}
+
 // this is basically the main install logic. tries apt first, only
 // bothers building from source if it has to
 fn install_target(
@@ -547,6 +613,21 @@ fn install_target(
             log(&format!("Skipped '{}'.", target), '-');
         }
         return;
+    }
+
+    // apt doesn't have it - check flatpak before giving up and compiling.
+    // a lot of stuff (especially GUI apps) is only on flathub or the apt
+    // version is way out of date, so this is worth checking first
+    if !is_git_url(target) && !force_build {
+        let flatpak_matches = flatpak_search_raw(target);
+        let exact = flatpak_matches
+            .into_iter()
+            .find(|(app_id, name, _)| app_id.eq_ignore_ascii_case(target) || name.eq_ignore_ascii_case(target));
+        if let Some((app_id, _, _)) = exact {
+            log(&format!("No apt binary for '{}', but found it on Flatpak.", target), '*');
+            install_via_flatpak(&app_id, noconfirm);
+            return;
+        }
     }
 
     if !is_git_url(target) && !package_binary_available(target) {
@@ -717,6 +798,7 @@ struct Entry {
 fn cmd_interactive(term: &str, noconfirm: bool, build_dir: &Path, skip_deps: bool, no_cache: bool, force_build: bool) {
     log(&format!("Searching for '{}' ...", term), '+');
     let apt_results = apt_search_raw(term);
+    let flatpak_results = flatpak_search_raw(term); // empty vec if flatpak isn't installed, no crash
     let state = load_state();
     let term_lower = term.to_lowercase();
     let buzz_results: Vec<(String, String)> = state
@@ -732,6 +814,11 @@ fn cmd_interactive(term: &str, noconfirm: bool, build_dir: &Path, skip_deps: boo
     for (n, v) in buzz_results {
         combined.push(Entry { kind: "buzz", name: n, extra: v });
     }
+    for (app_id, name, desc) in flatpak_results {
+        // extra shows the human readable name since app ids like
+        // org.gimp.GIMP arent super readable on their own
+        combined.push(Entry { kind: "flatpak", name: app_id, extra: format!("{} - {}", name, desc) });
+    }
 
     if combined.is_empty() {
         log("No results found.", '-');
@@ -742,7 +829,11 @@ fn cmd_interactive(term: &str, noconfirm: bool, build_dir: &Path, skip_deps: boo
     let count = combined.len();
     for (idx, entry) in combined.iter().enumerate().rev() {
         let real_idx = idx + 1;
-        let tag = if entry.kind == "buzz" { cyan("[buzz]") } else { dim("[apt]") };
+        let tag = match entry.kind {
+            "buzz" => cyan("[buzz]"),
+            "flatpak" => magenta("[flatpak]"),
+            _ => dim("[apt]"),
+        };
         println!("{}  {} {}  {}", yellow(&real_idx.to_string()), tag, green(&entry.name), dim(&entry.extra));
     }
     println!();
@@ -757,15 +848,23 @@ fn cmd_interactive(term: &str, noconfirm: bool, build_dir: &Path, skip_deps: boo
         return;
     }
 
-    let target_names: Vec<String> = picks.iter().map(|&i| combined[i - 1].name.clone()).collect();
-    log(&format!("About to install: {}", target_names.join(", ")), '+');
+    // gotta keep the kind attached to each pick now, not just the name,
+    // since flatpak stuff needs to go down a totally different path
+    let targets: Vec<(&'static str, String)> =
+        picks.iter().map(|&i| (combined[i - 1].kind, combined[i - 1].name.clone())).collect();
+    let names_only: Vec<&str> = targets.iter().map(|(_, n)| n.as_str()).collect();
+    log(&format!("About to install: {}", names_only.join(", ")), '+');
     if !confirm("Proceed with installation?", true, noconfirm) {
         log("Aborted.", '-');
         return;
     }
 
-    for name in target_names {
-        install_target(&name, build_dir, skip_deps, no_cache, noconfirm, force_build);
+    for (kind, name) in targets {
+        if kind == "flatpak" {
+            install_via_flatpak(&name, noconfirm);
+        } else {
+            install_target(&name, build_dir, skip_deps, no_cache, noconfirm, force_build);
+        }
     }
 }
 
@@ -775,6 +874,15 @@ fn cmd_search_cmd(term: &str) {
     log(&format!("Searching apt for '{}' ...", term), '+');
     for (name, desc) in apt_search_raw(term) {
         println!("  {}  {}", green(&name), dim(&desc));
+    }
+
+    let flatpak_matches = flatpak_search_raw(term);
+    if !flatpak_matches.is_empty() {
+        println!();
+        log("Matching Flatpak apps:", '+');
+        for (app_id, name, desc) in flatpak_matches {
+            println!("  {} {}  ({})  {}", magenta("[flatpak]"), green(&app_id), name, dim(&desc));
+        }
     }
 
     let state = load_state();
@@ -997,15 +1105,20 @@ fn print_help() {
     println!("buzz - a yay/paru-style package manager for Debian\n");
     println!("USAGE:");
     println!("  buzz <term>              interactive search + install picker");
-    println!("  buzz install <target>    binary if apt has one, else builds from source");
-    println!("  buzz search <term>       plain search");
+    println!("                            (searches apt AND flatpak, if installed)");
+    println!("  buzz install <target>    apt binary if one exists, else flatpak, else source");
+    println!("  buzz search <term>       plain search (apt + flatpak)");
     println!("  buzz upgrade              apt upgrade + rebuild tracked source packages");
-    println!("  buzz remove <name>       remove a package");
+    println!("  buzz remove <name>       remove a package (apt only - use 'flatpak uninstall'");
+    println!("                            for flatpak apps for now)");
     println!("  buzz clean                wipe build dir and .deb cache");
     println!("  buzz <apt-verb> ...      passthrough to apt-get (update, autoremove, ...)");
     println!("\nFlags:");
     println!("  --noconfirm    skip confirmation prompts");
     println!("  --build        force building from source even if a binary exists");
+    println!("\nNote: flatpak search/install only works if flatpak is installed.");
+    println!("      buzz won't install flatpak itself - grab it with your distro's");
+    println!("      normal package manager first (e.g. apt install flatpak).");
 }
 
 // -- entrypoint --
