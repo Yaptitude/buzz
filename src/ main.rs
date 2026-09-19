@@ -25,7 +25,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const APT_ONLY_VERBS: &[&str] = &[
-    "update", "autoremove", "purge", "list", "show", "depends", "rdepends",
+    // note: "list" used to be here but buzz has its own list command now,
+    // use `buzz apt-list` style passthrough via apt directly if you want
+    // the raw apt version
+    "update", "autoremove", "purge", "show", "depends", "rdepends",
     "policy", "dist-upgrade", "source", "download", "changelog", "autoclean",
 ];
 
@@ -66,7 +69,35 @@ fn log(msg: &str, level: char) {
     println!("{} {}", marker, msg);
 }
 
+// prints a big obvious "this actually finished" banner. used after
+// anything that changes the system (install/remove/upgrade/clean) so
+// someone new to the terminal isn't left staring at silence wondering
+// if it worked or if it's still doing something
+fn finish(msg: &str) {
+    let border_len = msg.chars().count().clamp(24, 60);
+    let border = "=".repeat(border_len);
+    println!();
+    println!("{}", green(&border));
+    println!("{}", bold(&green(&format!("✔ {}", msg))));
+    println!("{}", green(&border));
+    println!();
+}
+
+// same idea as finish() but for the failure case - big obvious red
+// banner so someone new to all this doesn't have to go hunting through
+// a wall of apt output to figure out that something actually broke
+fn fail_banner(msg: &str) {
+    let border_len = msg.chars().count().clamp(24, 60);
+    let border = "=".repeat(border_len);
+    println!();
+    println!("{}", red(&border));
+    println!("{}", bold(&red(&format!("✘ Something went wrong"))));
+    println!("{}", red(&border));
+    println!();
+}
+
 fn die(msg: &str) -> ! {
+    fail_banner(msg);
     log(msg, '-');
     // exit(1) not exit(0) obviously since this is the error path
     std::process::exit(1);
@@ -134,6 +165,55 @@ fn run(cmd: &[&str], cwd: Option<&Path>, sudo: bool) {
             full.join(" ")
         )),
         Err(e) => die(&format!("Command not found: {} ({})", full[0], e)),
+    }
+}
+
+// same as run() but retries a few times before giving up - only meant for
+// the commands that actually talk to the network (apt-get update/source,
+// git clone, flatpak install), since retrying something like a bad
+// dependency install would just waste time failing the same way 3x
+fn run_retry(cmd: &[&str], cwd: Option<&Path>, sudo: bool, attempts: u32) {
+    let mut full: Vec<String> = Vec::new();
+    if sudo && !running_as_root() {
+        full.push("sudo".to_string());
+    }
+    full.extend(cmd.iter().map(|s| s.to_string()));
+
+    for attempt in 1..=attempts {
+        if attempt == 1 {
+            log(&dim(&format!("Running: {}", full.join(" "))), '*');
+        } else {
+            log(&format!("Retrying ({}/{}): {}", attempt, attempts, full.join(" ")), '*');
+        }
+
+        let mut command = Command::new(&full[0]);
+        command.args(&full[1..]);
+        if let Some(dir) = cwd {
+            command.current_dir(dir);
+        }
+
+        match command.status() {
+            Ok(status) if status.success() => return,
+            Ok(_) if attempt < attempts => {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
+            Ok(status) => die(&format!(
+                "Command failed after {} attempt(s) ({}): {}",
+                attempts,
+                status.code().unwrap_or(-1),
+                full.join(" ")
+            )),
+            Err(e) if attempt < attempts => {
+                // command not found isn't going to fix itself by waiting, but
+                // this branch stays generic so a transient spawn failure
+                // (rare, but possible under load) still gets another shot
+                log(&format!("Spawn failed ({}), retrying ...", e), '*');
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
+            Err(e) => die(&format!("Command not found: {} ({})", full[0], e)),
+        }
     }
 }
 
@@ -437,14 +517,125 @@ fn clone_source(repo_url: &str, dest: &Path) -> PathBuf {
     }
     log(&format!("Cloning {} ...", repo_url), '+');
     let dest_str = dest.to_string_lossy().to_string();
-    run(&["git", "clone", "--depth", "1", repo_url, &dest_str], None, false);
+    run_retry(&["git", "clone", "--depth", "1", repo_url, &dest_str], None, false, 3);
     dest.to_path_buf()
 }
 
+// checks whether deb-src lines are actually enabled anywhere. apt-get
+// source is useless without them and the error message apt gives is
+// pretty opaque if you've never seen it before
+fn deb_src_enabled() -> bool {
+    // apt-get indextargets is the "proper" way to ask apt what it knows
+    // about, rather than parsing config files ourselves
+    match Command::new("apt-get").args(["indextargets", "--no-release-info"]).output() {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            text.contains("deb-src") || text.to_lowercase().contains("sources")
+        }
+        // if that fails for any reason fall back to grepping the config
+        // files directly - crude but works on both formats
+        _ => {
+            let classic = fs::read_to_string("/etc/apt/sources.list").unwrap_or_default();
+            if classic.lines().any(|l| l.trim_start().starts_with("deb-src")) {
+                return true;
+            }
+            if let Ok(entries) = fs::read_dir("/etc/apt/sources.list.d") {
+                for e in entries.filter_map(|e| e.ok()) {
+                    let content = fs::read_to_string(e.path()).unwrap_or_default();
+                    let has_classic = content.lines().any(|l| l.trim_start().starts_with("deb-src"));
+                    let has_deb822 = content.lines().any(|l| {
+                        let lt = l.trim_start();
+                        lt.starts_with("Types:") && lt.contains("deb-src")
+                    });
+                    if has_classic || has_deb822 {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+// offers to turn deb-src on rather than making the person go hunt down
+// sed commands. handles both the classic sources.list format and the
+// newer deb822 .sources format (ubuntu 24.04+, and derivatives)
+fn offer_enable_deb_src(noconfirm: bool) -> bool {
+    log("Source packages (deb-src) aren't enabled in your apt sources.", '-');
+    log("Without them, apt can't download source code to build from.", '*');
+
+    if !confirm("Enable deb-src automatically now?", true, noconfirm) {
+        log("Left apt sources unchanged.", '-');
+        return false;
+    }
+
+    let mut changed = false;
+
+    // deb822 format first (.sources files) - flip "Types: deb" into
+    // "Types: deb deb-src"
+    if let Ok(entries) = fs::read_dir("/etc/apt/sources.list.d") {
+        for e in entries.filter_map(|e| e.ok()) {
+            let path = e.path();
+            if path.extension().map(|x| x == "sources").unwrap_or(false) {
+                let content = fs::read_to_string(&path).unwrap_or_default();
+                if content.lines().any(|l| l.trim() == "Types: deb") {
+                    let patched: String = content
+                        .lines()
+                        .map(|l| if l.trim() == "Types: deb" { "Types: deb deb-src" } else { l })
+                        .collect::<Vec<&str>>()
+                        .join("\n");
+                    let tmp = std::env::temp_dir().join("buzz-sources-patch");
+                    if fs::write(&tmp, format!("{}\n", patched)).is_ok() {
+                        run(&["cp", &tmp.to_string_lossy(), &path.to_string_lossy()], None, true);
+                        log(&format!("Enabled deb-src in {}", path.display()), '+');
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // classic format - duplicate each "deb " line as a "deb-src " line
+    let classic_path = "/etc/apt/sources.list";
+    let classic = fs::read_to_string(classic_path).unwrap_or_default();
+    let already_has_src = classic.lines().any(|l| l.trim_start().starts_with("deb-src"));
+    if !classic.trim().is_empty() && !already_has_src {
+        let mut out_lines: Vec<String> = Vec::new();
+        for line in classic.lines() {
+            out_lines.push(line.to_string());
+            let lt = line.trim_start();
+            if lt.starts_with("deb ") {
+                out_lines.push(lt.replacen("deb ", "deb-src ", 1));
+            }
+        }
+        let tmp = std::env::temp_dir().join("buzz-sourceslist-patch");
+        if fs::write(&tmp, format!("{}\n", out_lines.join("\n"))).is_ok() {
+            run(&["cp", &tmp.to_string_lossy(), classic_path], None, true);
+            log(&format!("Enabled deb-src in {}", classic_path), '+');
+            changed = true;
+        }
+    }
+
+    if !changed {
+        log("Couldn't find anything to change in your apt sources.", '-');
+        return false;
+    }
+
+    log("Refreshing package lists ...", '+');
+    run_retry(&["apt-get", "update"], None, true, 3);
+    true
+}
+
 fn fetch_debian_source(pkg_name: &str, build_root: &Path) -> PathBuf {
+    // check up front instead of letting apt fail with its cryptic
+    // "You must put some 'deb-src' URIs in your sources.list" message
+    if !deb_src_enabled() {
+        offer_enable_deb_src(false);
+    }
+
     fresh_dir(build_root);
     log(&format!("Fetching Debian source package '{}' via apt-get source ...", pkg_name), '+');
-    run(&["apt-get", "source", pkg_name], Some(build_root), false);
+    run_retry(&["apt-get", "source", pkg_name], Some(build_root), false, 3);
     if let Ok(entries) = fs::read_dir(build_root) {
         for entry in entries.filter_map(|e| e.ok()) {
             if entry.path().is_dir() {
@@ -550,10 +741,11 @@ fn flatpak_ensure_flathub(noconfirm: bool) {
         return;
     }
     if confirm("Flatpak is installed but the flathub remote isn't set up. Add it now?", true, noconfirm) {
-        run(
+        run_retry(
             &["flatpak", "remote-add", "--if-not-exists", "flathub", "https://flathub.org/repo/flathub.flatpakrepo"],
             None,
             true,
+            3,
         );
     }
 }
@@ -585,14 +777,153 @@ fn flatpak_search_raw(term: &str) -> Vec<(String, String, String)> {
     results
 }
 
+// fuzzy lookup on flathub for something like "obs studios" or "obs-studio"
+// that should still find "OBS Studio" / com.obsproject.Studio. flatpak's
+// own search sometimes misses hyphenated queries, so if the raw term comes
+// back empty we retry with hyphens/underscores turned into spaces before
+// giving up
+fn find_flatpak_search_matches(term: &str) -> Vec<(String, String)> {
+    let norm_term = normalize(term);
+    let variants = [term.to_string(), term.replace(['-', '_'], " ")];
+
+    for variant in variants.iter() {
+        let hits: Vec<(String, String)> = flatpak_search_raw(variant)
+            .into_iter()
+            .filter(|(app_id, name, _)| {
+                let id_norm = normalize(app_id);
+                let name_norm = normalize(name);
+                id_norm.contains(&norm_term) || norm_term.contains(&id_norm) || name_norm.contains(&norm_term) || norm_term.contains(&name_norm)
+            })
+            .map(|(app_id, name, desc)| (app_id, format!("{} - {}", name, desc)))
+            .collect();
+        if !hits.is_empty() {
+            return hits;
+        }
+    }
+    Vec::new()
+}
+
+// same narrowing idea as find_apt_search_matches, but for the interactive
+// picker's flatpak column - keeps the full (app_id, name, desc) shape so
+// the picker can still show a readable label, not just the app id.
+// falls back to the raw list if narrowing empties it out entirely
+fn find_flatpak_matches_full(term: &str) -> Vec<(String, String, String)> {
+    let norm_term = normalize(term);
+    let all = flatpak_search_raw(term);
+    let narrowed: Vec<(String, String, String)> = all
+        .iter()
+        .filter(|(app_id, name, _)| {
+            let id_norm = normalize(app_id);
+            let name_norm = normalize(name);
+            id_norm.contains(&norm_term) || norm_term.contains(&id_norm) || name_norm.contains(&norm_term) || norm_term.contains(&name_norm)
+        })
+        .cloned()
+        .collect();
+    if narrowed.is_empty() {
+        all
+    } else {
+        narrowed
+    }
+}
+
+// checks dpkg's own database instead of apt-cache, since this is about
+// whats ACTUALLY installed right now, not what could be installed
+fn is_apt_installed(name: &str) -> bool {
+    Command::new("dpkg").args(["-s", name]).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+// looks through currently-installed flatpak apps (not flathub search
+// results) for something matching by app id or display name. returns the
+// app id if found since thats what flatpak uninstall actually wants
+// strips out spaces/dashes/underscores/case so "obs-studio", "obs studio",
+// "OBS Studio" and "obsstudio" all compare equal. this is what makes
+// vague/misremembered names still match
+fn normalize(s: &str) -> String {
+    s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+// when more than one flatpak app matches a vague search, show a quick
+// numbered list instead of just failing or guessing wrong. matches is
+// (app_id, label) pairs
+fn pick_from_matches(matches: &[(String, String)], noconfirm: bool, action: &str) -> Option<String> {
+    if matches.is_empty() {
+        return None;
+    }
+    if matches.len() == 1 {
+        return Some(matches[0].0.clone());
+    }
+
+    println!();
+    println!("{}", bold(&format!("A few Flatpak apps match - which one do you want to {}?", action)));
+    for (i, (app_id, label)) in matches.iter().enumerate() {
+        println!("  {} {}  {}", yellow(&format!("{})", i + 1)), label, dim(app_id));
+    }
+
+    if noconfirm {
+        // can't prompt with --noconfirm on, and guessing which one someone
+        // meant would be worse than just refusing
+        return None;
+    }
+
+    print!("{}", bold("Choose a number: "));
+    io::stdout().flush().ok();
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice).ok();
+    let idx: usize = choice.trim().parse().ok()?;
+    if idx >= 1 && idx <= matches.len() {
+        Some(matches[idx - 1].0.clone())
+    } else {
+        None
+    }
+}
+
+// list of every currently-installed flatpak app, as (app_id, display_name)
+fn flatpak_installed_apps() -> Vec<(String, String)> {
+    if !flatpak_available() {
+        return Vec::new();
+    }
+    let out = Command::new("flatpak").args(["list", "--app", "--columns=application,name"]).output();
+    let text = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Vec::new(),
+    };
+    text.lines()
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() >= 2 {
+                Some((cols[0].trim().to_string(), cols[1].trim().to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+// fuzzy version of the old exact-match lookup - finds installed flatpak
+// apps whose id or name loosely matches what was typed, then lets the
+// person pick if there's more than one candidate
+fn find_installed_flatpak_matches(term: &str) -> Vec<(String, String)> {
+    let norm_term = normalize(term);
+    flatpak_installed_apps()
+        .into_iter()
+        .filter(|(app_id, name)| {
+            let id_norm = normalize(app_id);
+            let name_norm = normalize(name);
+            id_norm.contains(&norm_term) || norm_term.contains(&id_norm) || name_norm.contains(&norm_term) || norm_term.contains(&name_norm)
+        })
+        .map(|(app_id, name)| (app_id.clone(), name))
+        .collect()
+}
+
 fn install_via_flatpak(app_id: &str, noconfirm: bool) {
     flatpak_ensure_flathub(noconfirm);
     if !confirm(&format!("Install '{}' via Flatpak?", app_id), true, noconfirm) {
         log(&format!("Skipped '{}'.", app_id), '-');
         return;
     }
-    run(&["flatpak", "install", "-y", "flathub", app_id], None, true);
+    run_retry(&["flatpak", "install", "-y", "flathub", app_id], None, true, 3);
     log(&format!("'{}' installed via Flatpak.", app_id), '+');
+    finish(&format!("'{}' is installed and ready to use.", app_id));
 }
 
 // this is basically the main install logic. tries apt first, only
@@ -604,11 +935,86 @@ fn install_target(
     no_cache: bool,
     noconfirm: bool,
     force_build: bool,
+    force_flatpak: bool,
 ) {
+    // check if its already installed before going through any of the
+    // source-decision logic below - no point asking "install from apt?"
+    // for something already sitting on the system
+    if !is_git_url(target) && !force_flatpak {
+        if is_apt_installed(target) {
+            if !confirm(&format!("'{}' is already installed (apt). Reinstall anyway?", target), false, noconfirm) {
+                log(&format!("Skipping - '{}' is already installed.", target), '-');
+                return;
+            }
+        } else if !force_build {
+            let installed_flatpak = find_installed_flatpak_matches(target);
+            if let Some((app_id, _)) = installed_flatpak.first() {
+                if !confirm(&format!("'{}' is already installed via Flatpak ({}). Reinstall anyway?", target, app_id), false, noconfirm) {
+                    log(&format!("Skipping - '{}' is already installed.", target), '-');
+                    return;
+                }
+            }
+        }
+    }
+
+    // --flatpak means skip apt entirely and go straight to flathub, even
+    // if apt has a binary too. useful when the apt version is old/broken
+    // or you just prefer sandboxed flatpak apps for certain things
+    if force_flatpak {
+        let matches = find_flatpak_search_matches(target);
+        match pick_from_matches(&matches, noconfirm, "install") {
+            Some(app_id) => install_via_flatpak(&app_id, noconfirm),
+            None if matches.is_empty() => {
+                fail_banner(&format!("couldn't find '{}' on Flathub", target));
+                log(&format!("'{}' wasn't found on Flathub.", target), '-');
+            }
+            None => log("No selection made - not installing anything.", '-'),
+        }
+        return;
+    }
+
     if !is_git_url(target) && !force_build && package_binary_available(target) {
+        // apt has it - but check if flatpak ALSO has it before just going
+        // with apt automatically. if both exist, let the person pick
+        // instead of silently deciding for them
+        let flatpak_matches = find_flatpak_search_matches(target);
+
+        if let Some((app_id, _)) = flatpak_matches.first() {
+            if noconfirm {
+                // no prompt possible with --noconfirm, just go with apt as
+                // the sensible default rather than silently picking flatpak
+                run(&["apt-get", "install", "-y", target], None, true);
+                log(&format!("'{}' installed from apt. No build needed.", target), '+');
+                finish(&format!("'{}' is installed and ready to use.", target));
+                return;
+            }
+
+            println!();
+            println!("{}", bold(&format!("'{}' is available from multiple sources:", target)));
+            println!("  {} apt (system package)", yellow("1)"));
+            println!("  {} Flatpak ({})", yellow("2)"), app_id);
+            print!("{}", bold("Choose a source (Enter = apt): "));
+            io::stdout().flush().ok();
+
+            let mut choice = String::new();
+            io::stdin().read_line(&mut choice).ok();
+
+            if choice.trim() == "2" {
+                install_via_flatpak(app_id, noconfirm);
+            } else {
+                // picking "1" (or just hitting Enter) IS the confirmation -
+                // no need to ask "install from apt?" again right after
+                run(&["apt-get", "install", "-y", target], None, true);
+                log(&format!("'{}' installed from apt. No build needed.", target), '+');
+                finish(&format!("'{}' is installed and ready to use.", target));
+            }
+            return;
+        }
+
         if confirm(&format!("Install '{}' from apt (prebuilt package)?", target), true, noconfirm) {
             run(&["apt-get", "install", "-y", target], None, true);
             log(&format!("'{}' installed from apt. No build needed.", target), '+');
+            finish(&format!("'{}' is installed and ready to use.", target));
         } else {
             log(&format!("Skipped '{}'.", target), '-');
         }
@@ -619,14 +1025,14 @@ fn install_target(
     // a lot of stuff (especially GUI apps) is only on flathub or the apt
     // version is way out of date, so this is worth checking first
     if !is_git_url(target) && !force_build {
-        let flatpak_matches = flatpak_search_raw(target);
-        let exact = flatpak_matches
-            .into_iter()
-            .find(|(app_id, name, _)| app_id.eq_ignore_ascii_case(target) || name.eq_ignore_ascii_case(target));
-        if let Some((app_id, _, _)) = exact {
-            log(&format!("No apt binary for '{}', but found it on Flatpak.", target), '*');
-            install_via_flatpak(&app_id, noconfirm);
-            return;
+        let matches = find_flatpak_search_matches(target);
+        if !matches.is_empty() {
+            log(&format!("No apt binary for '{}', but found something on Flatpak.", target), '*');
+            if let Some(app_id) = pick_from_matches(&matches, noconfirm, "install") {
+                install_via_flatpak(&app_id, noconfirm);
+                return;
+            }
+            // fell through with no pick - drop into the source-build path below
         }
     }
 
@@ -687,6 +1093,7 @@ fn build_from_source(target: &str, build_dir: &Path, skip_deps: bool, no_cache: 
                 },
             );
             save_state(&state);
+            finish(&format!("'{}' is installed (used the cached build, no rebuild needed).", name));
             return;
         }
     }
@@ -718,6 +1125,7 @@ fn build_from_source(target: &str, build_dir: &Path, skip_deps: bool, no_cache: 
     );
     save_state(&state);
     log(&format!("'{}' built and installed. That's buzz for ya.", name), '+');
+    finish(&format!("'{}' is installed and ready to use.", name));
 
     let mut do_cleanup = false;
     if !skip_deps {
@@ -725,6 +1133,7 @@ fn build_from_source(target: &str, build_dir: &Path, skip_deps: bool, no_cache: 
     }
     if do_cleanup {
         run(&["apt-get", "autoremove", "-y"], None, true);
+        log("Build dependencies removed.", '+');
     }
 }
 
@@ -743,6 +1152,30 @@ fn apt_search_raw(term: &str) -> Vec<(String, String)> {
         }
     }
     entries
+}
+
+// apt-cache search matches the FULL description, not just the name, so a
+// short term like "obs" pulls in "Observer pattern", "observation", etc -
+// anything with those letters buried in an unrelated word. narrow down to
+// packages whose NAME actually relates to the term, same normalize()
+// trick used for flatpak matching. falls back to the raw list if narrowing
+// would leave nothing, in case someone genuinely searched by description
+fn find_apt_search_matches(term: &str) -> Vec<(String, String)> {
+    let norm_term = normalize(term);
+    let all = apt_search_raw(term);
+    let narrowed: Vec<(String, String)> = all
+        .iter()
+        .filter(|(name, _)| {
+            let n = normalize(name);
+            n.contains(&norm_term) || norm_term.contains(&n)
+        })
+        .cloned()
+        .collect();
+    if narrowed.is_empty() {
+        all
+    } else {
+        narrowed
+    }
 }
 
 fn parse_selection(selection: &str, count: usize) -> BTreeSet<usize> {
@@ -795,10 +1228,18 @@ struct Entry {
     extra: String,
 }
 
-fn cmd_interactive(term: &str, noconfirm: bool, build_dir: &Path, skip_deps: bool, no_cache: bool, force_build: bool) {
+fn cmd_interactive(
+    term: &str,
+    noconfirm: bool,
+    build_dir: &Path,
+    skip_deps: bool,
+    no_cache: bool,
+    force_build: bool,
+    force_flatpak: bool,
+) {
     log(&format!("Searching for '{}' ...", term), '+');
-    let apt_results = apt_search_raw(term);
-    let flatpak_results = flatpak_search_raw(term); // empty vec if flatpak isn't installed, no crash
+    let apt_results = find_apt_search_matches(term);
+    let flatpak_results = find_flatpak_matches_full(term); // empty vec if flatpak isn't installed, no crash
     let state = load_state();
     let term_lower = term.to_lowercase();
     let buzz_results: Vec<(String, String)> = state
@@ -863,7 +1304,7 @@ fn cmd_interactive(term: &str, noconfirm: bool, build_dir: &Path, skip_deps: boo
         if kind == "flatpak" {
             install_via_flatpak(&name, noconfirm);
         } else {
-            install_target(&name, build_dir, skip_deps, no_cache, noconfirm, force_build);
+            install_target(&name, build_dir, skip_deps, no_cache, noconfirm, force_build, force_flatpak);
         }
     }
 }
@@ -872,11 +1313,11 @@ fn cmd_interactive(term: &str, noconfirm: bool, build_dir: &Path, skip_deps: boo
 
 fn cmd_search_cmd(term: &str) {
     log(&format!("Searching apt for '{}' ...", term), '+');
-    for (name, desc) in apt_search_raw(term) {
+    for (name, desc) in find_apt_search_matches(term) {
         println!("  {}  {}", green(&name), dim(&desc));
     }
 
-    let flatpak_matches = flatpak_search_raw(term);
+    let flatpak_matches = find_flatpak_matches_full(term);
     if !flatpak_matches.is_empty() {
         println!();
         log("Matching Flatpak apps:", '+');
@@ -899,14 +1340,58 @@ fn cmd_search_cmd(term: &str) {
     }
 }
 
+// shows details before you commit to installing something, instead of
+// going in blind off a one-line search description
+fn cmd_info(term: &str) {
+    log(&format!("Looking up '{}' ...", term), '+');
+    let mut found_anything = false;
+
+    if package_binary_available(term) {
+        found_anything = true;
+        println!();
+        log("apt package info:", '+');
+        if let Ok(o) = Command::new("apt-cache").args(["show", term]).output() {
+            if o.status.success() {
+                // apt-cache show already formats this nicely, just print it as-is
+                print!("{}", String::from_utf8_lossy(&o.stdout));
+            }
+        }
+    }
+
+    if flatpak_available() {
+        // use the same fuzzy matching as install/remove so `buzz info obs`
+        // works the same way `buzz install obs` does, instead of demanding
+        // the exact app id
+        let matches = find_flatpak_search_matches(term);
+        if let Some((app_id, _)) = matches.first() {
+            found_anything = true;
+            println!();
+            log(&format!("Flatpak info ({}):", app_id), '+');
+            if let Ok(o) = Command::new("flatpak").args(["remote-info", "--log", "flathub", app_id]).output() {
+                if o.status.success() {
+                    print!("{}", String::from_utf8_lossy(&o.stdout));
+                } else {
+                    // flathub remote might not be added yet, not a big deal,
+                    // just say so instead of silently printing nothing
+                    log("(couldn't fetch flatpak details - is the flathub remote set up?)", '*');
+                }
+            }
+        }
+    }
+
+    if !found_anything {
+        log(&format!("No info found for '{}' in apt or Flatpak.", term), '-');
+    }
+}
+
 fn cmd_upgrade(noconfirm: bool) {
     log("Updating apt package lists and upgrading system packages ...", '+');
-    run(&["apt-get", "update"], None, true);
+    run_retry(&["apt-get", "update"], None, true, 3);
     run(&["apt-get", "upgrade", "-y"], None, true);
 
     let mut state = load_state();
     if state.is_empty() {
-        log("No buzz-tracked source packages to check.", '+');
+        finish("Upgrade finished - your system is up to date.");
         return;
     }
 
@@ -946,7 +1431,10 @@ fn cmd_upgrade(noconfirm: bool) {
 
         let old_v = entry.version.clone().unwrap_or_else(|| "?".to_string());
         let new_v = new_version.clone().unwrap_or_else(|| "?".to_string());
-        if !confirm(&format!("Rebuild '{}' ({} -> {})?", name, old_v, new_v), true, noconfirm) {
+        // color-coded version diff so the change is obvious at a glance
+        // instead of squinting at two similar-looking version strings
+        let diff = format!("{} {} {}", red(&old_v), dim("->"), green(&new_v));
+        if !confirm(&format!("Rebuild '{}' ({})?", name, diff), true, noconfirm) {
             continue;
         }
 
@@ -968,41 +1456,122 @@ fn cmd_upgrade(noconfirm: bool) {
             },
         );
         save_state(&state);
+        // confirm each package finished before moving to the next one,
+        // otherwise it just looks like it silently jumped from build output
+        // straight into the next package with no closure
+        log(&format!("'{}' updated: {}", name, diff), '+');
     }
 
-    log("Upgrade complete.", '+');
+    finish("Upgrade finished - your system and tracked packages are up to date.");
 }
 
 fn cmd_remove(name: &str, purge: bool, purge_cache: bool, noconfirm: bool) {
-    let verb = if purge { "purge" } else { "remove" };
-    let mut chars = verb.chars();
-    let verb_cap = match chars.next() {
-        Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    };
+    // check apt first since thats the common case, only look at flatpak
+    // if apt doesnt know about it
+    if is_apt_installed(name) {
+        let verb = if purge { "purge" } else { "remove" };
+        let mut chars = verb.chars();
+        let verb_cap = match chars.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+        };
 
-    if !confirm(&format!("{} '{}'?", verb_cap, name), true, noconfirm) {
-        log("Aborted.", '-');
-        return;
-    }
-    run(&["apt-get", verb, "-y", name], None, true);
+        if !confirm(&format!("{} '{}'?", verb_cap, name), true, noconfirm) {
+            log("Aborted.", '-');
+            return;
+        }
+        run(&["apt-get", verb, "-y", name], None, true);
 
-    let mut state = load_state();
-    state_remove(&mut state, name);
-    save_state(&state);
+        let mut state = load_state();
+        state_remove(&mut state, name);
+        save_state(&state);
 
-    if purge_cache {
-        if let Ok(entries) = fs::read_dir(cache_dir()) {
-            let prefix = format!("{}-", name);
-            for e in entries.filter_map(|e| e.ok()) {
-                let fname = e.file_name().to_string_lossy().to_string();
-                if fname.starts_with(&prefix) {
-                    fs::remove_dir_all(e.path()).ok();
+        // this was the actual missing piece - after all that apt output
+        // scrolls by, say plainly that it worked instead of just falling
+        // through to the next prompt with nothing
+        let past_tense = if purge { "purged" } else { "removed" };
+        log(&format!("'{}' was {} successfully.", name, past_tense), '+');
+        finish(&format!("'{}' has been {}.", name, past_tense));
+
+        if purge_cache {
+            if let Ok(entries) = fs::read_dir(cache_dir()) {
+                let prefix = format!("{}-", name);
+                for e in entries.filter_map(|e| e.ok()) {
+                    let fname = e.file_name().to_string_lossy().to_string();
+                    if fname.starts_with(&prefix) {
+                        fs::remove_dir_all(e.path()).ok();
+                    }
                 }
             }
+            log(&format!("Purged cached builds for '{}'.", name), '+');
         }
-        log(&format!("Purged cached builds for '{}'.", name), '+');
+        return;
     }
+
+    let flatpak_matches = find_installed_flatpak_matches(name);
+    if let Some(app_id) = pick_from_matches(&flatpak_matches, noconfirm, "remove") {
+        if !confirm(&format!("Remove Flatpak app '{}'?", app_id), true, noconfirm) {
+            log("Aborted.", '-');
+            return;
+        }
+        run(&["flatpak", "uninstall", "-y", &app_id], None, true);
+        log(&format!("'{}' removed via Flatpak.", app_id), '+');
+        finish(&format!("'{}' has been removed.", app_id));
+        return;
+    }
+
+    if !flatpak_matches.is_empty() {
+        // pick_from_matches returned None with candidates present - either
+        // noconfirm blocked the prompt or the person didn't pick a valid number
+        log("No selection made - nothing removed.", '-');
+        return;
+    }
+
+    log(&format!("'{}' doesn't appear to be installed via apt or Flatpak.", name), '-');
+}
+
+// shows everything buzz knows about - source builds it tracks, plus a
+// summary of flatpak apps, so you don't have to cat state.json by hand
+fn cmd_list() {
+    let state = load_state();
+
+    println!();
+    if state.is_empty() {
+        log("No source-built packages tracked by buzz.", '*');
+    } else {
+        log("Source packages built by buzz:", '+');
+        for (name, entry) in &state {
+            let ver = entry.version.clone().unwrap_or_else(|| "unversioned".to_string());
+            let installed = if is_apt_installed(name) { green("installed") } else { red("not installed") };
+            println!(
+                "  {} {}  ({})  [{}]  <- {}",
+                cyan("[buzz]"),
+                green(name),
+                ver,
+                installed,
+                dim(&entry.source)
+            );
+        }
+    }
+
+    let flatpaks = flatpak_installed_apps();
+    if !flatpaks.is_empty() {
+        println!();
+        log("Flatpak apps installed on this system:", '+');
+        for (app_id, name) in &flatpaks {
+            println!("  {} {}  ({})", magenta("[flatpak]"), green(app_id), dim(name));
+        }
+    }
+
+    println!();
+    log(
+        &format!(
+            "{} source build(s) tracked, {} flatpak app(s) installed.",
+            state.len(),
+            flatpaks.len()
+        ),
+        '*',
+    );
 }
 
 fn cmd_clean(yes: bool) {
@@ -1016,7 +1585,51 @@ fn cmd_clean(yes: bool) {
     }
     fs::remove_dir_all(default_build_dir()).ok();
     fs::remove_dir_all(cache_dir()).ok();
-    log("Cleaned build and cache directories.", '+');
+    finish("All cleaned up - build cache and temp files are gone.");
+}
+
+// rebuilds and reinstalls buzz itself. has to be run from inside the git
+// checkout (or given the path to one) since the installed binary has no
+// idea where its own source lives - it's just a file in /usr/local/bin
+// at that point
+fn cmd_self_update(repo_path: Option<String>, noconfirm: bool) {
+    let repo_dir = match repo_path {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+
+    let cargo_toml = repo_dir.join("Cargo.toml");
+    if !cargo_toml.exists() {
+        die(&format!(
+            "no Cargo.toml found in {} - run this from inside your buzz checkout, \
+             or pass the path: buzz self-update /path/to/buzz",
+            repo_dir.display()
+        ));
+    }
+
+    if repo_dir.join(".git").exists() {
+        log("Pulling latest changes ...", '+');
+        run_retry(&["git", "pull"], Some(&repo_dir), false, 3);
+    } else {
+        log("(not a git checkout, skipping pull - just rebuilding what's already on disk)", '*');
+    }
+
+    if !confirm("Rebuild and reinstall buzz now?", true, noconfirm) {
+        log("Skipped.", '-');
+        return;
+    }
+
+    log("Building buzz (release) ...", '+');
+    run(&["cargo", "build", "--release"], Some(&repo_dir), false);
+
+    let built_bin = repo_dir.join("target").join("release").join("buzz");
+    if !built_bin.exists() {
+        die("build finished but the binary wasn't where it should be - something went wrong");
+    }
+
+    run(&["cp", &built_bin.to_string_lossy(), "/usr/local/bin/buzz"], None, true);
+    run(&["chmod", "755", "/usr/local/bin/buzz"], None, true);
+    finish("buzz has been rebuilt and reinstalled.");
 }
 
 fn cmd_passthrough(argv: &[String]) {
@@ -1025,6 +1638,10 @@ fn cmd_passthrough(argv: &[String]) {
         cmd.push(a.as_str());
     }
     run(&cmd, None, true);
+    // run() already exits the whole program on failure, so if we get here
+    // it actually worked - say so instead of just dropping back to the
+    // prompt with no closing sentence
+    log("Command finished successfully.", '+');
 }
 
 // -- per-subcommand arg parsing (no clap - just walk the tokens) --
@@ -1036,6 +1653,7 @@ fn cmd_install_cli(args: &[String]) {
     let mut no_cache = false;
     let mut noconfirm = false;
     let mut force_build = false;
+    let mut force_flatpak = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1048,8 +1666,9 @@ fn cmd_install_cli(args: &[String]) {
             }
             "--skip-deps" => skip_deps = true,
             "--no-cache" => no_cache = true,
-            "--noconfirm" => noconfirm = true,
+            "--noconfirm" | "-y" => noconfirm = true,
             "--build" => force_build = true,
+            "--flatpak" => force_flatpak = true,
             other => {
                 if target.is_none() {
                     target = Some(other.to_string());
@@ -1059,8 +1678,12 @@ fn cmd_install_cli(args: &[String]) {
         i += 1;
     }
 
+    if force_build && force_flatpak {
+        die("--build and --flatpak can't both be used - pick one source to force");
+    }
+
     let target = target.unwrap_or_else(|| die("install requires a target (package name or git URL)"));
-    install_target(&target, &build_dir, skip_deps, no_cache, noconfirm, force_build);
+    install_target(&target, &build_dir, skip_deps, no_cache, noconfirm, force_build, force_flatpak);
 }
 
 fn cmd_search_cli(args: &[String]) {
@@ -1068,8 +1691,13 @@ fn cmd_search_cli(args: &[String]) {
     cmd_search_cmd(&term);
 }
 
+fn cmd_info_cli(args: &[String]) {
+    let term = args.first().cloned().unwrap_or_else(|| die("info requires a package name"));
+    cmd_info(&term);
+}
+
 fn cmd_upgrade_cli(args: &[String]) {
-    let noconfirm = args.iter().any(|a| a == "--noconfirm");
+    let noconfirm = args.iter().any(|a| a == "--noconfirm" || a == "-y");
     cmd_upgrade(noconfirm);
 }
 
@@ -1083,7 +1711,7 @@ fn cmd_remove_cli(args: &[String]) {
         match a.as_str() {
             "--purge" => purge = true,
             "--purge-cache" => purge_cache = true,
-            "--noconfirm" => noconfirm = true,
+            "--noconfirm" | "-y" => noconfirm = true,
             other => {
                 if name.is_none() {
                     name = Some(other.to_string());
@@ -1101,6 +1729,12 @@ fn cmd_clean_cli(args: &[String]) {
     cmd_clean(yes);
 }
 
+fn cmd_self_update_cli(args: &[String]) {
+    let noconfirm = args.iter().any(|a| a == "--noconfirm" || a == "-y");
+    let repo_path = args.iter().find(|a| !a.starts_with('-')).cloned();
+    cmd_self_update(repo_path, noconfirm);
+}
+
 fn print_help() {
     println!("buzz - a yay/paru-style package manager for Debian\n");
     println!("USAGE:");
@@ -1108,17 +1742,23 @@ fn print_help() {
     println!("                            (searches apt AND flatpak, if installed)");
     println!("  buzz install <target>    apt binary if one exists, else flatpak, else source");
     println!("  buzz search <term>       plain search (apt + flatpak)");
+    println!("  buzz info <name>         show details before installing (apt + flatpak)");
     println!("  buzz upgrade              apt upgrade + rebuild tracked source packages");
-    println!("  buzz remove <name>       remove a package (apt only - use 'flatpak uninstall'");
-    println!("                            for flatpak apps for now)");
+    println!("  buzz remove <name>       removes it wherever it's actually installed from");
+    println!("                            (apt or flatpak, whichever applies)");
     println!("  buzz clean                wipe build dir and .deb cache");
+    println!("  buzz list                 show buzz-tracked builds + installed flatpaks");
+    println!("  buzz self-update [path]  rebuild + reinstall buzz itself (run from the");
+    println!("                            buzz checkout, or pass its path)");
     println!("  buzz <apt-verb> ...      passthrough to apt-get (update, autoremove, ...)");
     println!("\nFlags:");
-    println!("  --noconfirm    skip confirmation prompts");
+    println!("  --noconfirm, -y   skip confirmation prompts");
     println!("  --build        force building from source even if a binary exists");
+    println!("  --flatpak      force installing via Flatpak, skipping apt entirely");
     println!("\nNote: flatpak search/install only works if flatpak is installed.");
     println!("      buzz won't install flatpak itself - grab it with your distro's");
     println!("      normal package manager first (e.g. apt install flatpak).");
+    println!("      flatpak installs via buzz are system-wide (sudo), not per-user.");
 }
 
 // -- entrypoint --
@@ -1140,9 +1780,12 @@ fn main() {
     match first.as_str() {
         "install" => return cmd_install_cli(&argv[1..]),
         "search" => return cmd_search_cli(&argv[1..]),
+        "info" => return cmd_info_cli(&argv[1..]),
         "upgrade" => return cmd_upgrade_cli(&argv[1..]),
         "remove" => return cmd_remove_cli(&argv[1..]),
         "clean" => return cmd_clean_cli(&argv[1..]),
+        "list" => return cmd_list(),
+        "self-update" => return cmd_self_update_cli(&argv[1..]),
         _ => {}
     }
 
@@ -1152,15 +1795,19 @@ fn main() {
     }
 
     // bare word(s), not a known command or apt verb -> yay-style interactive search
-    let noconfirm = argv.iter().any(|a| a == "--noconfirm");
+    let noconfirm = argv.iter().any(|a| a == "--noconfirm" || a == "-y");
     let force_build = argv.iter().any(|a| a == "--build");
+    let force_flatpak = argv.iter().any(|a| a == "--flatpak");
     let term_words: Vec<&str> = argv
         .iter()
-        .filter(|a| a.as_str() != "--noconfirm" && a.as_str() != "--build")
+        .filter(|a| {
+            let s = a.as_str();
+            s != "--noconfirm" && s != "-y" && s != "--build" && s != "--flatpak"
+        })
         .map(|s| s.as_str())
         .collect();
     let term = term_words.join(" ");
-    cmd_interactive(&term, noconfirm, &default_build_dir(), false, false, force_build);
+    cmd_interactive(&term, noconfirm, &default_build_dir(), false, false, force_build, force_flatpak);
 }
 
 // -- tests (run with `cargo test`) --
